@@ -1,22 +1,13 @@
-import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
-import { getFirestore, collection, addDoc, serverTimestamp, onSnapshot, query, orderBy, getDocs, where, deleteDoc, doc } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
-import { getAuth, signInWithEmailAndPassword } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+import { collection, addDoc, serverTimestamp, onSnapshot, query, orderBy, getDocs, where } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+import { db } from "./firebase-config.js";
+import { map, drawnIcons, clearMarkers, addMarker, calculateDistance } from "./map-utils.js";
+import { updateChart } from "./chart-utils.js";
+import { setupAdminEasterEgg } from "./admin-auth.js";
 
-const firebaseConfig = {
-  apiKey: "AIzaSyDbgiGUR16k-E3lsHRNK_vt8gEIX-CxStc",
-  authDomain: "cc-recruitment-project.firebaseapp.com",
-  projectId: "cc-recruitment-project",
-  storageBucket: "cc-recruitment-project.firebasestorage.app",
-  messagingSenderId: "685808992166",
-  appId: "1:685808992166:web:c2ebfeba7ea1f8f226d967",
-  measurementId: "G-V1H80LW2NF"
-};
+// 1. Setup Admin Tools
+setupAdminEasterEgg();
 
-// Initialize Firebase
-const app = initializeApp(firebaseConfig);
-const db = getFirestore(app);
-const auth = getAuth(app);
-
+// 2. Device Identity for Anti-Fraud
 let deviceId = localStorage.getItem("ecoaudit_device_id");
 if (!deviceId) {
     deviceId = crypto.randomUUID ? crypto.randomUUID() : (Math.random().toString(36).substring(2) + Date.now().toString(36));
@@ -30,34 +21,7 @@ async function hashDeviceId(id) {
     return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-const map = L.map('map', {
-    center: [11.1271, 78.6569], // Starts at Tamil Nadu
-    zoom: 7,
-    dragging: true,
-    worldCopyJump: false,
-    zoomControl: true 
-});
-
-L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png', {
-    maxZoom: 19,
-    attribution: '© OpenStreetMap, © CartoDB'
-}).addTo(map);
-
-let markers = [];
-let drawnIcons = [];
-
-function calculateDistance(lat1, lon1, lat2, lon2) {
-    const R = 6371;
-    const dLat = (lat2 - lat1) * Math.PI / 180;
-    const dLon = (lon2 - lon1) * Math.PI / 180;
-    const a = 
-        Math.sin(dLat/2) * Math.sin(dLat/2) +
-        Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * 
-        Math.sin(dLon/2) * Math.sin(dLon/2);
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a)); 
-    return R * c; 
-}
-
+// 3. Form Submission & Validation Logic
 const form = document.getElementById("waste-form");
 const usernameInput = document.getElementById("username");
 const categoryInput = document.getElementById("category");
@@ -67,11 +31,8 @@ const errorEl = document.getElementById("error-message");
 
 form.addEventListener("submit", async (event) => {
     event.preventDefault();
-
-    // Reset error UI
     errorEl.style.display = "none";
-    errorEl.textContent = "";
-
+    
     const username = usernameInput.value.trim();
     const category = categoryInput.value;
     const weight = parseFloat(weightInput.value);
@@ -82,22 +43,18 @@ form.addEventListener("submit", async (event) => {
     try {
         const hashedId = await hashDeviceId(deviceId);
 
+        // Check if username is taken by another device
         const userQuery = query(collection(db, "wasteLogs"), where("username", "==", username));
         const querySnapshot = await getDocs(userQuery);
 
         if (!querySnapshot.empty) {
             let belongsToDevice = false;
             querySnapshot.forEach((doc) => {
-                if (doc.data().hashedDeviceId === hashedId) {
-                    belongsToDevice = true;
-                }
+                if (doc.data().hashedDeviceId === hashedId) belongsToDevice = true;
             });
 
             if (!belongsToDevice) {
-                errorEl.textContent = `The username "@${username}" is already taken by another device! Please choose a different name.`;
-                errorEl.style.display = "block";
-                submitBtn.textContent = "Submit Log";
-                submitBtn.disabled = false;
+                showError(`The username "@${username}" is already taken!`);
                 return;
             }
         }
@@ -105,131 +62,85 @@ form.addEventListener("submit", async (event) => {
         submitBtn.textContent = "Getting Location...";
 
         if (!navigator.geolocation) {
-            errorEl.textContent = "Geolocation is not supported by your browser!";
-            errorEl.style.display = "block";
-            submitBtn.textContent = "Submit Log";
-            submitBtn.disabled = false;
+            showError("Geolocation is not supported by your browser!");
             return;
         }
 
         navigator.geolocation.getCurrentPosition(async (position) => {
-            const lat = position.coords.latitude;
-            const lng = position.coords.longitude;
-            const accuracy = position.coords.accuracy;
+            const { latitude: lat, longitude: lng, accuracy } = position.coords;
             
             if (accuracy > 2000) {
-                errorEl.textContent = `Anti-Fraud Alert: GPS signal is too weak (accuracy: ${Math.round(accuracy)}m). Please connect to real GPS to log waste.`;
-                errorEl.style.display = "block";
-                submitBtn.textContent = "Submit Log";
-                submitBtn.disabled = false;
+                showError(`Anti-Fraud: GPS signal too weak (accuracy: ${Math.round(accuracy)}m).`);
                 return;
             }
 
+            // Speed Teleportation Check
             const lastLog = JSON.parse(localStorage.getItem("ecoaudit_last_log"));
             const now = Date.now();
             
             if (lastLog) {
                 const distanceKm = calculateDistance(lastLog.lat, lastLog.lng, lat, lng);
                 const timeDiffHours = (now - lastLog.time) / (1000 * 60 * 60); 
-                
-                if (timeDiffHours > 0) {
-                    const speed = distanceKm / timeDiffHours;
-                    if (speed > 1000) {
-                        errorEl.textContent = `Anti-Fraud Alert: Impossible travel speed detected (${Math.round(speed)} km/h). GPS Spoofing blocked!`;
-                        errorEl.style.display = "block";
-                        submitBtn.textContent = "Submit Log";
-                        submitBtn.disabled = false;
-                        return;
-                    }
+                if (timeDiffHours > 0 && (distanceKm / timeDiffHours) > 1000) {
+                    showError(`Anti-Fraud: Impossible travel speed detected. GPS Spoofing blocked!`);
+                    return;
                 }
             }
 
-            localStorage.setItem("ecoaudit_last_log", JSON.stringify({ lat: lat, lng: lng, time: now }));
+            localStorage.setItem("ecoaudit_last_log", JSON.stringify({ lat, lng, time: now }));
             submitBtn.textContent = "Saving to Database...";
 
             try {
                 await addDoc(collection(db, "wasteLogs"), {
-                    username: username,
-                    hashedDeviceId: hashedId,
-                    category: category,
-                    weight: weight,
-                    latitude: lat,
-                    longitude: lng,
-                    timestamp: serverTimestamp()
+                    username, hashedDeviceId: hashedId, category, weight, 
+                    latitude: lat, longitude: lng, timestamp: serverTimestamp()
                 });
 
-                confetti({
-                    particleCount: 150,
-                    spread: 70,
-                    origin: { y: 0.6 },
-                    colors: ['#007D5A', '#ffffff', '#81C784']
-                });
-
+                confetti({ particleCount: 150, spread: 70, origin: { y: 0.6 }, colors: ['#007D5A', '#ffffff', '#81C784'] });
                 if (navigator.vibrate) navigator.vibrate(200);
                 
-                categoryInput.value = "";
-                weightInput.value = "";
-                submitBtn.textContent = "Submit Log";
-                submitBtn.disabled = false;
-                
-                // Smooth scroll to Section 2 to see the new pin!
+                categoryInput.value = ""; weightInput.value = "";
+                resetButton();
                 document.getElementById('section2').scrollIntoView({ behavior: 'smooth' });
-
             } catch (error) {
-                console.error("Error adding document: ", error);
-                errorEl.textContent = "Error saving data to database.";
-                errorEl.style.display = "block";
-                submitBtn.textContent = "Submit Log";
-                submitBtn.disabled = false;
+                showError("Error saving data to database.");
             }
-
         }, (error) => {
-            console.error("Geolocation error:", error);
-            // Graceful Error Handling for Denied Location
-            errorEl.textContent = "Location access was denied! We need your GPS location to verify the entry. Please enable location permissions in your browser.";
-            errorEl.style.display = "block";
-            submitBtn.textContent = "Submit Log";
-            submitBtn.disabled = false;
-        }, {
-            enableHighAccuracy: true,
-            timeout: 10000,
-            maximumAge: 0
-        });
+            showError("Location access was denied! We need GPS to verify the entry.");
+        }, { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 });
 
     } catch (error) {
-        console.error("Verification error:", error);
-        errorEl.textContent = "Something went wrong verifying your username.";
-        errorEl.style.display = "block";
-        submitBtn.textContent = "Submit Log";
-        submitBtn.disabled = false;
+        showError("Something went wrong verifying your username.");
     }
 });
 
+function showError(msg) {
+    errorEl.textContent = msg;
+    errorEl.style.display = "block";
+    resetButton();
+}
+
+function resetButton() {
+    submitBtn.textContent = "Submit Log";
+    submitBtn.disabled = false;
+}
+
+// 4. Real-time Dashboard & Map rendering
 const logsList = document.getElementById("logs-list");
 const totalWeightEl = document.getElementById("total-weight");
-let wasteChart; // Variable to hold the Chart.js instance
-let allLogsData = []; // Store raw data for CSV export
+let allLogsData = []; 
 
 const q = query(collection(db, "wasteLogs"), orderBy("timestamp", "desc"));
 
 onSnapshot(q, (snapshot) => {
     let totalWeight = 0;
-    let sumLat = 0;
-    let sumLng = 0;
-    let logCount = 0;
+    let sumLat = 0, sumLng = 0, logCount = 0;
     
-    // Reset lists
     logsList.innerHTML = ""; 
-    drawnIcons = [];
     allLogsData = [];
-    markers.forEach(marker => map.removeLayer(marker));
-    markers = [];
+    clearMarkers();
 
-    // Reset Chart Data Categories
-    const categoryTotals = {
-        "Plastic": 0, "E-Waste": 0, "Organic": 0,
-        "Paper": 0, "Glass": 0, "Other": 0
-    };
+    const categoryTotals = { "Plastic": 0, "E-Waste": 0, "Organic": 0, "Paper": 0, "Glass": 0, "Other": 0 };
 
     if (snapshot.empty) {
         logsList.innerHTML = `<li class="empty-state">No waste logged yet! Be the first!</li>`;
@@ -238,57 +149,33 @@ onSnapshot(q, (snapshot) => {
         return;
     }
 
-    // 1. Process all logs for Map, Stats, and Chart
     snapshot.forEach((doc) => {
         const data = doc.data();
-        allLogsData.push(data); // Save for CSV
+        allLogsData.push(data); 
         
         if (data.weight) {
             totalWeight += data.weight;
-            // Add weight to specific category for the chart
-            if (categoryTotals[data.category] !== undefined) {
-                categoryTotals[data.category] += data.weight;
-            } else {
-                categoryTotals["Other"] += data.weight;
-            }
+            categoryTotals[categoryTotals[data.category] !== undefined ? data.category : "Other"] += data.weight;
         }
 
-        // Add Markers to Map (Cluster based on weight!)
         if (data.latitude && data.longitude) {
-            sumLat += data.latitude;
-            sumLng += data.longitude;
-            logCount++;
+            sumLat += data.latitude; sumLng += data.longitude; logCount++;
             
-            // Scale icon size based on weight (Base 24px + 1px per kg, Max 50px)
-            const size = Math.min(50, 24 + data.weight);
-            const scaledIcon = L.icon({
-                iconUrl: 'trashicon.png',
-                iconSize: [size, size],
-                iconAnchor: [size / 2, size],
-                popupAnchor: [0, -size]
-            });
-
-            // Density Check: Max 15 logs in a 5km radius
+            // Check density limit (max 15 logs per 5km)
             let nearbyCount = 0;
             for (let icon of drawnIcons) {
                 if (calculateDistance(data.latitude, data.longitude, icon.lat, icon.lng) <= 5) nearbyCount++;
             }
 
             if (nearbyCount < 15) {
-                const marker = L.marker([data.latitude, data.longitude], {icon: scaledIcon})
-                    .addTo(map)
-                    .bindPopup(`<b>@${data.username || 'anonymous'}</b><br>${data.category}: ${data.weight.toFixed(2)}kg`);
-                markers.push(marker);
-                drawnIcons.push({lat: data.latitude, lng: data.longitude});
+                const popup = `<b>@${data.username || 'anonymous'}</b><br>${data.category}: ${data.weight.toFixed(2)}kg`;
+                addMarker(data.latitude, data.longitude, data.weight, popup);
             }
         }
     });
 
-    // 2. Render Top 7 Heaviest Logs
-    // Sort array descending by weight
-    const sortedByWeight = [...allLogsData].sort((a, b) => b.weight - a.weight);
-    const top7 = sortedByWeight.slice(0, 7);
-
+    // Render Top 7 Heaviest
+    const top7 = [...allLogsData].sort((a, b) => b.weight - a.weight).slice(0, 7);
     top7.forEach(data => {
         const li = document.createElement("li");
         li.className = "log-item";
@@ -303,143 +190,30 @@ onSnapshot(q, (snapshot) => {
         logsList.appendChild(li);
     });
 
-    // Update the total weight UI
     totalWeightEl.innerHTML = `${totalWeight.toFixed(2)} <span class="unit">kg</span>`;
-    
-    // Update the Bar Graph UI
     updateChart(categoryTotals);
 
-    // Automatically center map based on logs
+    // Auto-center map
     if (logCount > 0) {
-        const centerLat = sumLat / logCount;
-        const centerLng = sumLng / logCount;
-        const bounds = L.circle([centerLat, centerLng], {radius: 500000}).getBounds();
+        const bounds = L.circle([sumLat / logCount, sumLng / logCount], {radius: 500000}).getBounds();
         map.fitBounds(bounds);
     }
 });
 
-Chart.defaults.color = '#b0b0b0';
-Chart.defaults.borderColor = 'rgba(255,255,255,0.05)';
-
-function updateChart(categoryData) {
-    const ctx = document.getElementById('wasteChart').getContext('2d');
-    
-    // Destroy previous chart if it exists to redraw
-    if (wasteChart) {
-        wasteChart.destroy();
-    }
-    
-    wasteChart = new Chart(ctx, {
-        type: 'bar',
-        data: {
-            labels: Object.keys(categoryData),
-            datasets: [{
-                label: 'Weight (kg)',
-                data: Object.values(categoryData),
-                backgroundColor: '#00C48C',
-                borderRadius: 4
-            }]
-        },
-        options: {
-            responsive: true,
-            scales: {
-                y: { beginAtZero: true }
-            }
-        }
-    });
-}
-
+// 5. CSV Export
 document.getElementById('download-csv').addEventListener('click', () => {
-    if (allLogsData.length === 0) {
-        alert("No data available to download.");
-        return;
-    }
+    if (allLogsData.length === 0) return alert("No data available to download.");
     
-    let csvContent = "data:text/csv;charset=utf-8,";
-    // Add Headers
-    csvContent += "Username,Category,Weight (kg),Latitude,Longitude,Timestamp\n";
-    
-    // Add Rows
+    let csvContent = "data:text/csv;charset=utf-8,Username,Category,Weight (kg),Latitude,Longitude,Timestamp\n";
     allLogsData.forEach(row => {
         let dateStr = row.timestamp ? new Date(row.timestamp.toDate()).toISOString() : "Pending...";
         csvContent += `${row.username || 'anonymous'},${row.category},${row.weight},${row.latitude},${row.longitude},${dateStr}\n`;
     });
     
-    // Trigger Download
-    const encodedUri = encodeURI(csvContent);
     const link = document.createElement("a");
-    link.setAttribute("href", encodedUri);
-    link.setAttribute("download", "ecoaudit_logs.csv");
+    link.href = encodeURI(csvContent);
+    link.download = "ecoaudit_logs.csv";
     document.body.appendChild(link);
     link.click();
-    document.body.removeChild(link);
-});
-
-const titleEl = document.getElementById('eco-title');
-const adminModal = document.getElementById('admin-modal');
-const adminForm = document.getElementById('admin-login-form');
-const cancelAdminBtn = document.getElementById('cancel-admin-btn');
-const adminError = document.getElementById('admin-error');
-let tapCount = 0;
-let tapTimer;
-
-if (titleEl) {
-    titleEl.addEventListener('click', async () => {
-        tapCount++;
-        clearTimeout(tapTimer);
-        
-        if (tapCount >= 5) {
-            tapCount = 0;
-            // Show Admin Modal
-            adminModal.style.display = 'flex';
-        } else {
-            tapTimer = setTimeout(() => {
-                tapCount = 0;
-            }, 800); 
-        }
-    });
-}
-
-cancelAdminBtn.addEventListener('click', () => {
-    adminModal.style.display = 'none';
-    adminForm.reset();
-    adminError.style.display = 'none';
-});
-
-adminForm.addEventListener('submit', async (e) => {
-    e.preventDefault();
-    adminError.style.display = 'none';
-    
-    const email = document.getElementById('admin-email').value;
-    const pwd = document.getElementById('admin-password').value;
-    const btn = document.getElementById('login-admin-btn');
-    
-    btn.textContent = "Authenticating...";
-    btn.disabled = true;
-
-    try {
-        await signInWithEmailAndPassword(auth, email, pwd);
-        
-        if (confirm("WARNING: You are authenticated as an Admin. You are about to permanently delete ALL waste logs. Proceed?")) {
-            btn.textContent = "Resetting Database...";
-            const querySnapshot = await getDocs(collection(db, "wasteLogs"));
-            const deletePromises = [];
-            querySnapshot.forEach((documentSnap) => {
-                deletePromises.push(deleteDoc(doc(db, "wasteLogs", documentSnap.id)));
-            });
-            await Promise.all(deletePromises);
-            alert("Database successfully reset to zero!");
-            window.location.reload(); 
-        } else {
-            btn.textContent = "Login & Reset";
-            btn.disabled = false;
-            adminModal.style.display = 'none';
-            adminForm.reset();
-        }
-    } catch (error) {
-        adminError.textContent = "Access Denied: Invalid credentials.";
-        adminError.style.display = 'block';
-        btn.textContent = "Login & Reset";
-        btn.disabled = false;
-    }
+    link.remove();
 });
